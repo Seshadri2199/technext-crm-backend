@@ -1,11 +1,17 @@
 package com.technext.crm.service;
 
+import com.technext.crm.model.Attendance;
+import com.technext.crm.model.Holiday;
 import com.technext.crm.model.Leave;
 import com.technext.crm.model.LeaveBalance;
+import com.technext.crm.repository.AttendanceRepository;
+import com.technext.crm.repository.HolidayRepository;
 import com.technext.crm.repository.LeaveRepository;
 import com.technext.crm.repository.LeaveBalanceRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -18,6 +24,12 @@ public class LeaveService {
 
     @Autowired
     private LeaveBalanceRepository leaveBalanceRepository;
+
+    @Autowired
+    private AttendanceRepository attendanceRepository;
+
+    @Autowired
+    private HolidayRepository holidayRepository;
 
     public List<Leave> getAllLeaves() {
         return leaveRepository.findByOrderByCreatedAtDesc();
@@ -32,7 +44,6 @@ public class LeaveService {
     }
 
     public Leave applyLeave(Leave leave) {
-        // Auto-initialize leave balance if not exists
         autoInitLeaveBalance(leave.getEmployeeId(), leave.getEmployeeName());
         leave.setStatus("Pending");
         leave.setCreatedAt(LocalDateTime.now());
@@ -64,10 +75,18 @@ public class LeaveService {
                         balance.setAnnualLeaveUsed(
                             balance.getAnnualLeaveUsed() + leave.getDays());
                         break;
+                    case "Maternity Leave":
+                    case "Paternity Leave":
+                        // No balance deduction for maternity/paternity
+                        break;
                 }
                 leaveBalanceRepository.save(balance);
             }
         }
+
+        // AUTO-MARK ATTENDANCE for all leave days
+        autoMarkAttendanceForLeave(leave);
+
         return leaveRepository.save(leave);
     }
 
@@ -81,7 +100,8 @@ public class LeaveService {
 
     public Leave cancelLeave(Integer id) {
         Leave leave = leaveRepository.findById(id).orElseThrow();
-        // Restore balance if previously approved
+
+        // Restore leave balance if was approved paid leave
         if ("Approved".equals(leave.getStatus()) &&
             !leave.getLeaveType().equals("Loss of Pay")) {
             Optional<LeaveBalance> balanceOpt = leaveBalanceRepository
@@ -105,8 +125,90 @@ public class LeaveService {
                 leaveBalanceRepository.save(balance);
             }
         }
+
+        // Remove attendance records for those leave days
+        if ("Approved".equals(leave.getStatus())) {
+            clearAttendanceForLeave(leave);
+        }
+
         leave.setStatus("Cancelled");
         return leaveRepository.save(leave);
+    }
+
+    // =====================================================
+    // AUTO-MARK ATTENDANCE when leave is approved
+    // Key logic:
+    // - Paid leave (CL/SL/AL) → mark as "On Leave" → NO salary cut
+    // - Loss of Pay → mark as "Absent" → SALARY WILL BE CUT
+    // - Weekends → skip (mark as "Weekend")
+    // - Government/Festival holidays → skip (mark as "Holiday")
+    // =====================================================
+    private void autoMarkAttendanceForLeave(Leave leave) {
+        if (leave.getFromDate() == null || leave.getToDate() == null) return;
+
+        String attendanceStatus;
+        if ("Loss of Pay".equals(leave.getLeaveType())) {
+            attendanceStatus = "Absent"; // Will be counted as LOP → salary cut
+        } else {
+            attendanceStatus = "On Leave"; // Paid leave → no salary cut
+        }
+
+        LocalDate current = leave.getFromDate();
+        LocalDate end = leave.getToDate();
+
+        while (!current.isAfter(end)) {
+            // Skip weekends
+            boolean isWeekend = current.getDayOfWeek() == DayOfWeek.SATURDAY ||
+                               current.getDayOfWeek() == DayOfWeek.SUNDAY;
+
+            // Skip government/festival holidays
+            boolean isHoliday = holidayRepository.existsByDate(current);
+
+            if (!isWeekend && !isHoliday) {
+                // Check if attendance already exists for this day
+                Optional<Attendance> existing = attendanceRepository
+                    .findByEmployeeIdAndDate(leave.getEmployeeId(), current);
+
+                Attendance att;
+                if (existing.isPresent()) {
+                    att = existing.get();
+                } else {
+                    att = new Attendance();
+                    att.setEmployeeId(leave.getEmployeeId());
+                    att.setEmployeeName(leave.getEmployeeName());
+                    att.setDate(current);
+                }
+
+                att.setStatus(attendanceStatus);
+                att.setNotes(leave.getLeaveType() + " (Leave ID: " + leave.getId() + ")");
+                attendanceRepository.save(att);
+            }
+
+            current = current.plusDays(1);
+        }
+    }
+
+    // Clear attendance records when leave is cancelled
+    private void clearAttendanceForLeave(Leave leave) {
+        if (leave.getFromDate() == null || leave.getToDate() == null) return;
+
+        LocalDate current = leave.getFromDate();
+        LocalDate end = leave.getToDate();
+
+        while (!current.isAfter(end)) {
+            Optional<Attendance> existing = attendanceRepository
+                .findByEmployeeIdAndDate(leave.getEmployeeId(), current);
+
+            if (existing.isPresent()) {
+                Attendance att = existing.get();
+                // Only clear if it was marked by this leave
+                if (att.getNotes() != null &&
+                    att.getNotes().contains("Leave ID: " + leave.getId())) {
+                    attendanceRepository.delete(att);
+                }
+            }
+            current = current.plusDays(1);
+        }
     }
 
     // Auto-initialize leave balance when not exists
@@ -123,7 +225,7 @@ public class LeaveService {
         balance.setSickLeaveUsed(0);
         balance.setAnnualLeaveTotal(15);
         balance.setAnnualLeaveUsed(0);
-        balance.setYear(java.time.LocalDate.now().getYear());
+        balance.setYear(LocalDate.now().getYear());
         return leaveBalanceRepository.save(balance);
     }
 
@@ -135,6 +237,7 @@ public class LeaveService {
         return autoInitLeaveBalance(employeeId, employeeName);
     }
 
+    // Count LOP days from approved Loss of Pay leaves for a month
     public int getLopDaysForMonth(Integer employeeId, int month, int year) {
         List<Leave> leaves = leaveRepository.findByEmployeeId(employeeId);
         return (int) leaves.stream()
@@ -149,9 +252,8 @@ public class LeaveService {
             .sum();
     }
 
-    // Get total approved leave days (any type) for month — for payslip LOP
+    // Count total absence days (LOP leaves) for payslip
     public int getTotalAbsenceDaysForMonth(Integer employeeId, int month, int year) {
-        // Count only LOP leaves — paid leaves don't cut salary
         return getLopDaysForMonth(employeeId, month, year);
     }
 }
