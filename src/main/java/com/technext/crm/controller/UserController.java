@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
+import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,11 +32,19 @@ public class UserController {
         return userService.getAllUsers();
     }
 
+    @GetMapping("/{id}")
+    public ResponseEntity<User> getUserById(@PathVariable Integer id) {
+        return userService.getAllUsers().stream()
+            .filter(u -> u.getId().equals(id))
+            .findFirst()
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+
     @PostMapping("/login")
     public ResponseEntity<Map<String, Object>> login(@RequestBody Map<String, String> credentials) {
         String email = credentials.get("email");
         String password = credentials.get("password");
-
         Map<String, Object> response = new HashMap<>();
 
         Optional<User> userOpt = userService.getAllUsers()
@@ -50,8 +59,6 @@ public class UserController {
         }
 
         User user = userOpt.get();
-
-        // Check plain text password OR BCrypt
         boolean passwordMatch = password.equals(user.getPassword()) ||
             passwordEncoder.matches(password, user.getPassword());
 
@@ -61,9 +68,7 @@ public class UserController {
             return ResponseEntity.status(401).body(response);
         }
 
-        // Generate JWT token
         String token = jwtUtil.generateToken(user.getEmail(), user.getRole());
-
         response.put("success", true);
         response.put("token", token);
         response.put("user", user);
@@ -74,7 +79,6 @@ public class UserController {
     public ResponseEntity<Map<String, Object>> createUser(@RequestBody User user) {
         Map<String, Object> response = new HashMap<>();
         try {
-            // Check if email already exists
             boolean exists = userService.getAllUsers()
                 .stream()
                 .anyMatch(u -> u.getEmail().equals(user.getEmail()));
@@ -97,12 +101,75 @@ public class UserController {
     }
 
     @PutMapping("/{id}")
-    public User updateUser(@PathVariable Integer id, @RequestBody User user) {
-        return userService.updateUser(id, user);
+    public ResponseEntity<User> updateUser(@PathVariable Integer id, @RequestBody User user) {
+        User updated = userService.updateUser(id, user);
+        return ResponseEntity.ok(updated);
+    }
+
+    // Update salary and employee details - Admin/HR Manager only
+    @PutMapping("/{id}/salary")
+    public ResponseEntity<Map<String, Object>> updateSalary(
+            @PathVariable Integer id,
+            @RequestBody Map<String, Object> body) {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            User user = userService.getAllUsers()
+                .stream()
+                .filter(u -> u.getId().equals(id))
+                .findFirst()
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+            if (body.containsKey("basicSalary") && body.get("basicSalary") != null)
+                user.setBasicSalary(new BigDecimal(body.get("basicSalary").toString()));
+            if (body.containsKey("department") && body.get("department") != null)
+                user.setDepartment((String) body.get("department"));
+            if (body.containsKey("employeeId") && body.get("employeeId") != null)
+                user.setEmployeeId((String) body.get("employeeId"));
+            if (body.containsKey("role") && body.get("role") != null)
+                user.setRole((String) body.get("role"));
+            if (body.containsKey("joiningDate") && body.get("joiningDate") != null) {
+                user.setJoiningDate(java.time.LocalDate.parse(body.get("joiningDate").toString()));
+            }
+
+            User saved = userService.updateUser(id, user);
+            response.put("success", true);
+            response.put("user", saved);
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.status(500).body(response);
+        }
+    }
+
+    // Update profile picture
+    @PutMapping("/{id}/profile-picture")
+    public ResponseEntity<Map<String, Object>> updateProfilePicture(
+            @PathVariable Integer id,
+            @RequestBody Map<String, String> body) {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            User user = userService.getAllUsers()
+                .stream()
+                .filter(u -> u.getId().equals(id))
+                .findFirst()
+                .orElseThrow();
+
+            user.setProfilePicture(body.get("profilePicture"));
+            User saved = userService.updateUser(id, user);
+            response.put("success", true);
+            response.put("user", saved);
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.status(500).body(response);
+        }
     }
 
     @DeleteMapping("/{id}")
-    public void deleteUser(@PathVariable Integer id) {
+    public ResponseEntity<Void> deleteUser(@PathVariable Integer id) {
         userService.deleteUser(id);
+        return ResponseEntity.ok().build();
     }
 }
